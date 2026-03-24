@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.direnv/
+result
+dist/
+build/
+*.spec
