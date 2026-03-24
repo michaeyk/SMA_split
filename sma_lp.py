@@ -181,6 +181,14 @@ def parse_args():
     p.add_argument("--width", type=float, default=3.0, help="Symmetric %% above/below SMA (default: 3.0)")
     p.add_argument("--wallet", default=None, help="Wallet address for balance check")
     p.add_argument("--rpc-url", default=DEFAULT_RPC, help="Arbitrum RPC URL")
+    p.add_argument(
+        "--rebalance", action="store_true",
+        help="When out of range, suggest a one-sided LP to minimize swapping",
+    )
+    p.add_argument(
+        "--rebalance-margin", type=float, default=1.0,
+        help="How far below/above current price for the near edge (%%, default: 1.0)",
+    )
     return p.parse_args()
 
 
@@ -244,10 +252,13 @@ def main():
     print(f"    Upper Bound:  {upper_vs_current:+.2f}% from current")
     print()
 
+    out_of_range = None
     if current_price <= Pa:
         print(f"  Current price is BELOW the range (100% {token0_sym}).")
+        out_of_range = "below"
     elif current_price >= Pb:
         print(f"  Current price is ABOVE the range (100% {token1_sym}).")
+        out_of_range = "above"
     else:
         print("  Current price is INSIDE the range.")
 
@@ -256,6 +267,39 @@ def main():
     print()
     print(f"  {token0_sym}: {pct0:.1f}% of position value")
     print(f"  {token1_sym}: {pct1:.1f}% of position value")
+
+    # --- Rebalance: one-sided LP when out of range ---
+    rebalance_Pa = None
+    rebalance_Pb = None
+    if args.rebalance and out_of_range:
+        margin = args.rebalance_margin / 100
+        if out_of_range == "below":
+            # Price dropped — we hold all token0.  Put the near edge just
+            # below current price so the position is heavily token0.
+            # Far edge stays at the original upper bound (SMA + width).
+            rebalance_Pa = current_price * (1 - margin)
+            rebalance_Pb = Pb
+        else:
+            # Price rose — we hold all token1.  Put the near edge just
+            # above current price so the position is heavily token1.
+            # Far edge stays at the original lower bound (SMA - width).
+            rebalance_Pa = Pa
+            rebalance_Pb = current_price * (1 + margin)
+
+        rb_pct0, rb_pct1 = compute_value_split(current_price, rebalance_Pa, rebalance_Pb)
+        rb_lower_vs = (rebalance_Pa - current_price) / current_price * 100
+        rb_upper_vs = (rebalance_Pb - current_price) / current_price * 100
+
+        print()
+        print("=== Rebalance: One-Sided LP ===")
+        print()
+        print(f"  Strategy:       Mean-reversion (minimize swap, stay heavy "
+              f"{token0_sym if out_of_range == 'below' else token1_sym})")
+        print(f"  Lower Bound:    {rebalance_Pa:.6f} {t1_label}  ({rb_lower_vs:+.2f}% from current)")
+        print(f"  Upper Bound:    {rebalance_Pb:.6f} {t1_label}  ({rb_upper_vs:+.2f}% from current)")
+        print()
+        print(f"  {token0_sym}: {rb_pct0:.1f}% of position value")
+        print(f"  {token1_sym}: {rb_pct1:.1f}% of position value")
 
     # --- Wallet section ---
     if args.wallet:
@@ -270,8 +314,12 @@ def main():
             print(f"\nError querying wallet: {e}", file=sys.stderr)
             sys.exit(1)
 
+        # Use rebalance range when active, otherwise the normal SMA range
+        sizing_Pa = rebalance_Pa if rebalance_Pa is not None else Pa
+        sizing_Pb = rebalance_Pb if rebalance_Pb is not None else Pb
+
         total_value = bal0 * current_price + bal1
-        needed0, needed1 = compute_position_sizing(total_value, current_price, Pa, Pb)
+        needed0, needed1 = compute_position_sizing(total_value, current_price, sizing_Pa, sizing_Pb)
         diff0 = needed0 - bal0
         diff1 = needed1 - bal1
 
@@ -282,7 +330,8 @@ def main():
         print(f"  {token1_sym} held:     {bal1:.8f}")
         print(f"  Total value:   {total_value:.6f} {t1_label}")
         print()
-        print("=== Position Sizing ===")
+        sizing_label = "Position Sizing (rebalance)" if rebalance_Pa is not None else "Position Sizing"
+        print(f"=== {sizing_label} ===")
         print()
         print(f"  {token0_sym} needed:   {needed0:.8f}  ({needed0 * current_price:.6f} {t1_label} worth)")
         print(f"  {token1_sym} needed:   {needed1:.8f}")
